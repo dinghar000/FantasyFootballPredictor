@@ -1,0 +1,437 @@
+---
+title: "Fantasy_Football"
+author: "Harry"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error = TRUE)
+```
+
+```{r}
+library(nflreadr)
+library(zoo)
+library(ggrepel)
+library(tidyverse)
+library(dplyr)
+```
+
+# Full Fantasy Statistics (Everything)
+```{r}
+stats <- load_player_stats(2026)
+
+View(stats)
+```
+
+### Stats We Care About
+```{r}
+fantasy_players <- stats%>%
+  filter(position %in% c("QB", "RB", "WR", "TE"))
+
+fantasy_players <- fantasy_players %>%
+  mutate(fantasy_points_half_ppr =
+           fantasy_points_ppr - (receptions * 0.5))
+
+fantasy_rankings <- fantasy_players %>% filter(week == max(week)) %>%
+  select(
+    player_display_name,
+    position,
+    team,
+    week,
+    fantasy_points_half_ppr
+  ) %>%
+  arrange(desc(fantasy_points_half_ppr)) %>% relocate(fantasy_points_half_ppr, .after = player_display_name)
+
+View(fantasy_rankings)
+
+```
+
+###Fantasy Averages
+```{r} 
+fantasy_averages <- fantasy_players %>% 
+  group_by(player_display_name, position, team) %>% 
+  summarize(
+    average_points = mean(fantasy_points_half_ppr, na.rm = TRUE)
+    ) %>%
+      arrange(desc(average_points))
+
+View(fantasy_averages)
+```
+
+### Recent Fantasy Avgs
+```{r}
+fantasy_recent_avg <- fantasy_players %>% 
+  group_by(player_display_name, position, team) %>%
+  arrange(week, .by_group = TRUE) %>%
+  mutate(
+    recent_avg = rollmean(
+      fantasy_points_half_ppr, k = 3, fill = NA, align = "right"
+    )
+  ) %>% 
+  summarize(
+    season_avg = mean(fantasy_points_half_ppr, na.rm = TRUE), 
+    recent_avg = last(recent_avg),
+    avg_targets = mean(targets, na.rm = TRUE),
+    avg_carries = mean(carries, na.rm = TRUE)
+  ) %>%
+    arrange(desc(season_avg), desc(recent_avg), desc(avg_targets))
+          
+View(fantasy_recent_avg)
+```
+
+```{r}
+fantasy_model_data <- fantasy_players %>%
+  group_by(player_display_name) %>%
+  summarise(
+    position = first(position),
+    team = last(team),
+
+    avg_fantasy_points = mean(
+      fantasy_points_half_ppr,
+      na.rm = TRUE),
+
+    recent_avg = mean(
+      tail(fantasy_points_half_ppr, 3),
+      na.rm = TRUE),
+
+    avg_targets = mean(
+      targets,
+      na.rm = TRUE),
+
+    avg_carries = mean(
+      carries,
+      na.rm = TRUE),
+
+    .groups = "drop"
+  )
+View(fantasy_model_data)
+```
+
+### Matchup Difficulty
+
+```{r}
+schedule <- load_schedules(2026)
+#View(schedule)
+home_schedule <- schedule %>% 
+  select(week,home_team, away_team) %>% 
+  rename(
+    team = home_team,
+    opponent = away_team
+  )
+away_schedule <- schedule %>% 
+  select(week, home_team, away_team) %>% 
+  rename(
+    team = away_team,
+    opponent = home_team
+  )
+team_schedule <- bind_rows(
+  home_schedule,
+  away_schedule
+) %>% 
+  arrange(week, team)
+
+#View(team_schedule)
+
+fantasy_with_opponent <- fantasy_players %>% 
+  left_join(
+    team_schedule,
+    by = c("team", "week")
+  ) %>% 
+  select(player_display_name, position, team, week, opponent, fantasy_points_half_ppr)
+
+View(fantasy_with_opponent)
+```
+
+```{r}
+defense_weekly <- fantasy_with_opponent %>% 
+  group_by(opponent, position, week) %>% 
+  summarize( 
+    points_allowed = sum(fantasy_points_half_ppr, na.rm = TRUE)) %>% 
+  ungroup()
+
+View(defense_weekly)
+
+defense_matchup <- defense_weekly %>% 
+  group_by(opponent, position) %>% 
+  summarize(avg_points_allowed = mean(points_allowed, na.rm = TRUE),
+           .groups = "drop") %>% 
+  arrange(desc(avg_points_allowed))
+
+defense_matchup <- defense_matchup %>% 
+  group_by(position) %>% 
+  mutate(matchup_zscore = (avg_points_allowed - mean(avg_points_allowed, na.rm = TRUE))/sd(avg_points_allowed, na.rm = TRUE)) %>% 
+  ungroup()
+
+View(defense_matchup)
+
+next_week <- max(fantasy_players$week, na.rm = TRUE) + 1
+upcoming_schedule <- team_schedule %>% 
+  filter(week == next_week)
+
+fantasy_model_data <- fantasy_model_data %>% 
+  left_join(upcoming_schedule, by = "team")
+
+fantasy_model_data <- fantasy_model_data %>% 
+  left_join(defense_matchup, by = c("opponent", "position"))
+
+View(fantasy_model_data)
+```
+
+### Chart to see The Teams Defense in Ranked Order
+```{r}
+ggplot(defense_matchup %>% filter(position == "RB"), mapping = aes(y = avg_points_allowed, x = reorder(opponent, -avg_points_allowed), fill = position)) + 
+  geom_col() + coord_flip() + 
+  labs(
+    x = "Defensive Team",
+    y = "Average Points Allowed to this Position"
+  )
+```
+
+
+### Plots to see who the Best Players Are 
+```{r}
+fantasy_wr <- fantasy_players %>%
+  filter(position == "WR") %>%
+  group_by(player_display_name) %>%
+  summarize(
+    avg_targets = mean(targets, na.rm = TRUE),
+    season_avg = mean(fantasy_points_half_ppr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(fantasy_wr, mapping = aes(
+  x = avg_targets,
+  y = season_avg
+)) +
+  geom_point() +
+  geom_text_repel(aes(label = player_display_name), size = 2) +
+  geom_smooth(method = "lm", se = FALSE)
+```
+
+```{r}
+fantasy_rb <- fantasy_players %>%
+  filter(position == "RB") %>%
+  group_by(player_display_name) %>%
+  summarize(
+    avg_carries = mean(carries, na.rm = TRUE),
+    avg_targets = mean(targets, na.rm = TRUE),
+    season_avg = mean(fantasy_points_half_ppr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(fantasy_rb, mapping = aes(
+  x = avg_carries,
+  y = season_avg
+)) +
+  geom_point() +
+  geom_text_repel(aes(label = player_display_name), size = 2) +
+  geom_smooth(method = "lm", se = FALSE) + 
+  labs(x = "Average Carries per Game",
+      y = "Average Half-PPR per Game")
+
+ggplot(fantasy_rb, mapping = aes(x = avg_targets, y = season_avg)) + 
+  geom_point() + 
+  geom_text_repel(aes(label = player_display_name), size = 2) + 
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Average Targets per Game",
+      y = "Average Half-PPR per Game")
+```
+
+```{r}
+fantasy_te <- fantasy_players %>%
+  filter(position == "TE") %>%
+  group_by(player_display_name) %>%
+  summarize(
+    avg_targets = mean(targets, na.rm = TRUE),
+    season_avg = mean(fantasy_points_half_ppr, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+ggplot(fantasy_te, mapping = aes(
+  x = avg_targets,
+  y = season_avg
+)) +
+  geom_point() +
+  geom_text_repel(aes(label = player_display_name), size = 2) +
+  geom_smooth(method = "lm", se = FALSE)
+```
+
+
+# Our First Predictor Model!!!!
+```{r}
+# Experimental weights selected using 2021-2024, evaluated on 2025.
+# QB improved MAE by 0.128; RB worsened by 0.050; TE improved by 0.003;
+# WR uses the season-average baseline. These are not universally optimal.
+# Source this file after building fantasy_model_data, instead of the final
+# prediction chunk. The earlier defense_matchup join must already exist.
+position_weights <- tibble::tribble(
+  ~position, ~season_weight, ~recent_weight, ~matchup_weight,
+  "QB",      0.75,           0.25,           0.05,
+  "RB",      0.75,           0.25,           0.10,
+  "WR",      1.00,           0.00,           0.00,
+  "TE",      1.00,           0.00,           0.05
+)
+
+apply_position_weights <- function(data, weights=position_weights) {
+  required <- c('position','avg_fantasy_points','recent_avg','matchup_zscore')
+  stopifnot(all(required %in% names(data)), !anyDuplicated(weights$position),
+    all(data$position %in% weights$position))
+  data %>%
+    dplyr::select(-dplyr::any_of(c('season_weight','recent_weight','matchup_weight'))) %>%
+    dplyr::left_join(weights, by='position') %>%
+    dplyr::mutate(
+      baseline_prediction = season_weight * avg_fantasy_points +
+        dplyr::if_else(recent_weight == 0, 0, recent_weight * recent_avg),
+      predicted_points = baseline_prediction *
+        (1 + dplyr::if_else(matchup_weight == 0, 0, matchup_weight * matchup_zscore))
+    ) %>%
+    dplyr::select(-baseline_prediction) %>%
+    dplyr::relocate(predicted_points, .before=position)
+}
+
+if (exists('fantasy_model_data')) {
+  fantasy_model_data <- apply_position_weights(fantasy_model_data)
+}
+View(fantasy_model_data)
+```
+
+### Finding the right weights
+
+```{r}
+# 1. Prepare historical results
+history <- fantasy_with_opponent %>%
+  filter(
+    !is.na(fantasy_points_half_ppr),
+    !is.na(opponent)
+  ) %>%
+  arrange(week)
+
+# Start predicting after at least three weeks
+prediction_weeks <- sort(unique(history$week))
+prediction_weeks <- prediction_weeks[prediction_weeks >= 4]
+
+# 2. Build predictions using only information available before each week
+backtest <- purrr::map_dfr(prediction_weeks, function(w) {
+
+  past <- history %>% filter(week < w)
+  actual <- history %>% filter(week == w)
+
+  player_averages <- past %>%
+    arrange(week) %>%
+    group_by(player_display_name, position) %>%
+    summarise(
+      games_played = n(),
+      season_avg = mean(fantasy_points_half_ppr),
+      recent_avg = mean(tail(fantasy_points_half_ppr, 3)),
+      .groups = "drop"
+    ) %>%
+    filter(games_played >= 3)
+
+  defense_scores <- past %>%
+    group_by(opponent, position, week) %>%
+    summarise(
+      points_allowed = sum(fantasy_points_half_ppr),
+      .groups = "drop"
+    ) %>%
+    group_by(opponent, position) %>%
+    summarise(
+      avg_allowed = mean(points_allowed),
+      .groups = "drop"
+    ) %>%
+    group_by(position) %>%
+    mutate(
+      matchup_zscore =
+        (avg_allowed - mean(avg_allowed)) / sd(avg_allowed)
+    ) %>%
+    ungroup()
+
+  actual %>%
+    inner_join(
+      player_averages,
+      by = c("player_display_name", "position")
+    ) %>%
+    left_join(
+      defense_scores,
+      by = c("opponent", "position")
+    ) %>%
+    mutate(
+      # Use a neutral matchup when a score isn't available
+      matchup_zscore = if_else(
+        is.finite(matchup_zscore), matchup_zscore, 0
+      )
+    )
+})
+
+# 3. Reserve later weeks for a final, independent check
+weeks <- sort(unique(backtest$week))
+
+if (length(weeks) < 3) {
+  stop("Need at least three backtest weeks. Use more historical data.")
+}
+
+split_at <- floor(length(weeks) * 0.7)
+
+tuning_data <- backtest %>%
+  filter(week %in% weeks[seq_len(split_at)])
+
+test_data <- backtest %>%
+  filter(week %in% weeks[(split_at + 1):length(weeks)])
+
+# 4. Try different weights
+# Recent-average weight is always 1 minus season-average weight
+weight_grid <- tidyr::expand_grid(
+  season_weight = c(0, 0.25, 0.4, 0.5, 0.75, 1),
+  matchup_weight = c(0, 0.05, 0.1, 0.15)
+)
+
+weight_results <- weight_grid %>%
+  mutate(
+    MAE = purrr::map2_dbl(
+      season_weight,
+      matchup_weight,
+      function(sw, mw) {
+        prediction <- (
+          sw * tuning_data$season_avg +
+          (1 - sw) * tuning_data$recent_avg
+        ) * (1 + mw * tuning_data$matchup_zscore)
+
+        mean(abs(
+          prediction - tuning_data$fantasy_points_half_ppr
+        ))
+      }
+    )
+  ) %>%
+  arrange(MAE)
+
+View(weight_results)
+
+# 5. Evaluate the best weights on the untouched later weeks
+best <- weight_results %>% slice(1)
+
+test_results <- test_data %>%
+  mutate(
+    model_prediction = (
+      best$season_weight * season_avg +
+      (1 - best$season_weight) * recent_avg
+    ) * (1 + best$matchup_weight * matchup_zscore)
+  )
+
+comparison <- test_results %>%
+  summarise(
+    player_weeks_tested = n(),
+    baseline_MAE = mean(
+      abs(season_avg - fantasy_points_half_ppr)
+    ),
+    model_MAE = mean(
+      abs(model_prediction - fantasy_points_half_ppr)
+    )
+  )
+
+print(best) 
+print(comparison)
+```
+
+
+
+
